@@ -75,7 +75,7 @@ spec:
     metadata:  
       labels:  
         app: ${app}
-    spec:         
+    spec:        
       containers:     
       - name: ${app}     
         image: \$REPOSITORY    

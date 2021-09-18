@@ -1,0 +1,158 @@
+node {
+   stage('拉取代码') { 
+   //拉取代码
+    git credentialsId: '1039ae40-e253-44d6-91b2-add077cac146', url: 'https://gitee.com/xsre/tomcat-java-demo.git'
+    script {
+      env.imageTag = sh (script: 'git rev-parse --short HEAD ${GIT_COMMIT}', returnStdout: true).trim()
+}
+//   stage('扫描代码') { 
+//        sh '''
+//        export JAVA_HOME=/home/bsh/tools/jdk1.8.0_221
+//        mvn compile sonar:sonar \
+//        -Dsonar.projectKey=${JOB_NAME} \
+//        -Dsonar.host.url=http://10.0.10.51:9000 \
+//        -Dsonar.login=62e9550f5de66f8f6ff758016dad2afe12938291
+//        '''
+//}
+//   stage('获取扫描报告') { 
+//        sh '''
+//        bash /home/bsh/scripts/sonarqube.sh  ${JOB_NAME}
+//        '''
+//}
+   stage('编译代码') { 
+        sh '''
+        export JAVA_HOME=/home/bsh/tools/jdk1.8.0_221
+        mvn clean install -Dmaven.test.skip=true
+        '''
+}
+   }
+   // 项目打包到镜像并推送到镜像仓库
+   stage('构建推送镜像') {
+sh '''
+REPOSITORY=wenlongxue/tomcat:tomcat-demo-${BUILD_NUMBER}-${imageTag}
+cat > Dockerfile << EOF
+FROM wenlongxue/tomcat
+
+ADD  target/*.war  /usr/local/tomcat/webapps/ROOT.war
+
+ENTRYPOINT ["/usr/local/tomcat/bin/catalina.sh", "run"]
+
+EOF
+
+docker build -t tomcat:tomcat-demo-${BUILD_NUMBER}-${imageTag} .
+docker login
+docker tag tomcat:tomcat-demo-${BUILD_NUMBER}-${imageTag} $REPOSITORY
+docker push $REPOSITORY
+'''
+   }
+   // 部署到k8s主机
+   stage('部署到k8s') 
+{
+sh '''
+app=tomcat
+REPOSITORY=wenlongxue/tomcat:tomcat-demo-${BUILD_NUMBER}-${imageTag}
+cat > ${app}.yaml << EOF
+apiVersion: apps/v1 
+kind: Deployment   
+metadata:             
+  name: ${app}-deployment     
+  labels:       
+    app: ${app}  
+spec:          
+  replicas: 2 
+  selector:      
+    matchLabels: 
+      app: ${app}
+  minReadySeconds: 1
+  progressDeadlineSeconds: 60
+  revisionHistoryLimit: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+  template:        
+    metadata:  
+      labels:  
+        app: ${app}
+    spec:         
+      containers:     
+      - name: ${app}     
+        image: \$REPOSITORY    
+        imagePullPolicy: Always          
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "80m"
+          limits: 
+            memory: "2Gi" 
+            cpu: "80m"
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 180
+          periodSeconds: 5
+          timeoutSeconds: 3
+          successThreshold: 1
+          failureThreshold: 30
+        volumeMounts:
+        - mountPath: "/usr/local/tomcat/logs"
+          name: tomcat
+# pvc 部分
+      volumes:
+      - name: tomcat
+        persistentVolumeClaim:
+          claimName: tomcat
+---
+# Service 部分
+apiVersion: v1
+kind: Service
+metadata:      
+  name: ${app}-service
+  labels:      
+    app: ${app} 
+spec:        
+  selector:   
+    app: ${app}  
+  ports:
+  - name: ${app}-port 
+    protocol: TCP      
+    port: 8080         
+    targetPort: 8080   
+  type: ClusterIP 
+---
+# ingress 
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tomcat
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+spec:
+  rules:
+  - host: tomcat.cnsre.cn
+    http:
+      paths:
+      - path: "/"
+        pathType: Prefix
+        backend:
+          service:
+            name: tomcat-service
+            port:
+              number: 8080
+EOF
+sudo /usr/local/bin/kubectl  apply -f  ${app}.yaml
+'''
+   }
+   stage('检查服务状态') 
+{
+sh'''
+app=tomcat
+sleep 10m
+sudo sh  /home/bsh/scripts/check_k8s.sh  ${app}
+'''
+}
+}
